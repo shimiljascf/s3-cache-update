@@ -4,7 +4,7 @@ Enhanced S3 Cache-Control Management Script
 ============================================
 Features:
 - Update cache-control headers for objects by folder/file patterns
-- Add custom tags to identify objects updated by script
+- Add custom user-defined metadata (x-amz-meta-*) to identify objects updated by script
 - Revert changes using backup metadata
 - Dry-run mode for testing
 - Parallel processing for large buckets
@@ -33,20 +33,22 @@ DEFAULT_MAX_WORKERS = 10
 # File extensions to update (images and SVGs by default)
 DEFAULT_ALLOWED_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.ico',
-    '.svg', '.tiff', '.tif', '.avif', '.heic', '.heif'
+    '.svg'
 }
 
 # Skip specific extensions (HTML, CSS, JS)
-DEFAULT_SKIP_EXTENSIONS = {'.html', '.htm', '.css', '.js', '.json', '.xml', '.txt'}
+DEFAULT_SKIP_EXTENSIONS = {'.html', '.htm', '.css', '.js', '.json', '.xml', '.txt','.tiff', '.tif', '.avif', '.heic', '.heif'}
 
 # Backup file location
 BACKUP_DIR = '.s3_cache_backups'
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# Custom tag to identify objects updated by this script
-SCRIPT_TAG_KEY = 'CacheControlUpdatedBy'
-SCRIPT_TAG_VALUE = 'S3CacheControlManagerByScript'
-TIMESTAMP_TAG_KEY = 'CacheControlUpdateTime'
+# Custom metadata to identify objects updated by this script
+# Note: S3 user-defined metadata keys are automatically lowercased
+# and prefixed with 'x-amz-meta-' by AWS
+METADATA_UPDATED_BY_KEY = 'updated-by'  # Will become: x-amz-meta-updated-by
+METADATA_UPDATED_BY_VALUE = 'S3CacheControlManager'
+METADATA_UPDATE_TIME_KEY = 'update-time'  # Will become: x-amz-meta-update-time
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -204,61 +206,6 @@ def verify_aws_credentials(s3_client, bucket: str) -> bool:
         return False
 
 
-def get_object_tags(s3_client, bucket: str, key: str) -> Dict[str, str]:
-    """
-    Get tags for an S3 object.
-    
-    Args:
-        s3_client: Boto3 S3 client
-        bucket: S3 bucket name
-        key: S3 object key
-    
-    Returns:
-        Dictionary of tag key-value pairs
-    """
-    try:
-        response = s3_client.get_object_tagging(Bucket=bucket, Key=key)
-        return {tag['Key']: tag['Value'] for tag in response.get('TagSet', [])}
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        if error_code != 'NoSuchTagSet':
-            print(f"⚠️  Warning: Could not get tags for {key}: {error_code}")
-        return {}
-    except Exception as e:
-        print(f"⚠️  Warning: Error getting tags for {key}: {e}")
-        return {}
-
-
-def set_object_tags(s3_client, bucket: str, key: str, tags: Dict[str, str]) -> bool:
-    """
-    Set tags for an S3 object.
-    
-    Args:
-        s3_client: Boto3 S3 client
-        bucket: S3 bucket name
-        key: S3 object key
-        tags: Dictionary of tag key-value pairs
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        tag_set = [{'Key': k, 'Value': v} for k, v in tags.items()]
-        s3_client.put_object_tagging(
-            Bucket=bucket,
-            Key=key,
-            Tagging={'TagSet': tag_set}
-        )
-        return True
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        print(f"⚠️  Warning: Could not set tags for {key}: {error_code}")
-        return False
-    except Exception as e:
-        print(f"⚠️  Warning: Error setting tags for {key}: {e}")
-        return False
-
-
 def list_all_objects(s3_client, bucket: str, prefix: str = '') -> List[str]:
     """
     List all objects in an S3 bucket with optional prefix.
@@ -315,10 +262,10 @@ def update_object_metadata(
     cache_control: str,
     dry_run: bool = False,
     save_backup: bool = True,
-    add_tags: bool = True
+    add_metadata: bool = True
 ) -> Dict:
     """
-    Update cache-control metadata for a single S3 object and add custom tags.
+    Update cache-control metadata for a single S3 object and add custom metadata.
     
     Args:
         s3_client: Boto3 S3 client
@@ -327,7 +274,7 @@ def update_object_metadata(
         cache_control: Cache-Control header value
         dry_run: If True, don't actually make changes
         save_backup: If True, include original metadata in return
-        add_tags: If True, add custom tags to identify the update
+        add_metadata: If True, add custom metadata to identify the update
     
     Returns:
         Dictionary with status, key, backup data, and optional error/info
@@ -345,11 +292,6 @@ def update_object_metadata(
             else:
                 return {'status': 'error', 'key': key, 'error': f'Head object failed: {error_code}'}
         
-        # Get current tags
-        current_tags = {}
-        if add_tags:
-            current_tags = get_object_tags(s3_client, bucket, key)
-        
         # Store backup data
         backup_data = None
         if save_backup:
@@ -361,7 +303,6 @@ def update_object_metadata(
                 'content_encoding': response.get('ContentEncoding'),
                 'content_language': response.get('ContentLanguage'),
                 'content_disposition': response.get('ContentDisposition'),
-                'tags': current_tags
             }
         
         # Check if Cache-Control is already set correctly
@@ -383,7 +324,13 @@ def update_object_metadata(
             }
         
         # Prepare metadata for copy
-        metadata = response.get('Metadata', {})
+        metadata = response.get('Metadata', {}).copy()  # Copy existing metadata
+        
+        # Add custom metadata if enabled
+        if add_metadata:
+            metadata[METADATA_UPDATED_BY_KEY] = METADATA_UPDATED_BY_VALUE
+            metadata[METADATA_UPDATE_TIME_KEY] = datetime.utcnow().isoformat() + 'Z'
+        
         content_type = response.get('ContentType', 'binary/octet-stream')
         
         # Build copy arguments
@@ -411,13 +358,6 @@ def update_object_metadata(
         # Perform the copy
         s3_client.copy_object(**copy_args)
         
-        # Add custom tags to identify this update
-        if add_tags:
-            new_tags = current_tags.copy()
-            new_tags[SCRIPT_TAG_KEY] = SCRIPT_TAG_VALUE
-            new_tags[TIMESTAMP_TAG_KEY] = datetime.utcnow().isoformat() + 'Z'
-            set_object_tags(s3_client, bucket, key, new_tags)
-        
         return {'status': 'success', 'key': key, 'backup': backup_data}
     
     except ClientError as e:
@@ -434,7 +374,7 @@ def update_object_metadata(
 
 def revert_object_metadata(s3_client, bucket: str, backup_item: Dict, dry_run: bool = False) -> Dict:
     """
-    Revert an object's metadata from backup data, including tags.
+    Revert an object's metadata from backup data.
     
     Args:
         s3_client: Boto3 S3 client
@@ -493,10 +433,6 @@ def revert_object_metadata(s3_client, bucket: str, backup_item: Dict, dry_run: b
         # Perform the copy
         s3_client.copy_object(**copy_args)
         
-        # Restore original tags
-        if 'tags' in backup_item and backup_item['tags']:
-            set_object_tags(s3_client, bucket, key, backup_item['tags'])
-        
         return {'status': 'success', 'key': key}
     
     except ClientError as e:
@@ -533,10 +469,10 @@ def operation_update(args):
     # Display configuration
     print(f"\nBucket: {args.bucket}")
     print(f"Cache-Control: {args.cache_control}")
-    print(f"Custom Tagging: {'ENABLED' if not args.no_tags else 'DISABLED'}")
-    if not args.no_tags:
-        print(f"  Tag: {SCRIPT_TAG_KEY}={SCRIPT_TAG_VALUE}")
-        print(f"  Tag: {TIMESTAMP_TAG_KEY}=<timestamp>")
+    print(f"Custom Metadata: {'ENABLED' if not args.no_metadata else 'DISABLED'}")
+    if not args.no_metadata:
+        print(f"  Metadata: x-amz-meta-{METADATA_UPDATED_BY_KEY}={METADATA_UPDATED_BY_VALUE}")
+        print(f"  Metadata: x-amz-meta-{METADATA_UPDATE_TIME_KEY}=<timestamp>")
     print(f"Dry Run Mode: {'ENABLED (no changes will be made)' if args.dry_run else 'DISABLED'}")
     print(f"Max Workers: {args.max_workers}")
     
@@ -630,7 +566,7 @@ def operation_update(args):
                 args.cache_control,
                 args.dry_run,
                 not args.no_backup,
-                not args.no_tags
+                not args.no_metadata
             ): key
             for key in filtered_keys
         }
@@ -679,10 +615,10 @@ def operation_update(args):
     print(f"Already correct: {skipped_count_existing}")
     print(f"Errors: {error_count}")
     print(f"Skipped (filtered out): {skipped_count}")
-    if not args.no_tags and not args.dry_run:
-        print(f"\n🏷️  Tagged objects with:")
-        print(f"   {SCRIPT_TAG_KEY}={SCRIPT_TAG_VALUE}")
-        print(f"   {TIMESTAMP_TAG_KEY}=<timestamp>")
+    if not args.no_metadata and not args.dry_run:
+        print(f"\n📝 Added custom metadata to objects:")
+        print(f"   x-amz-meta-{METADATA_UPDATED_BY_KEY}={METADATA_UPDATED_BY_VALUE}")
+        print(f"   x-amz-meta-{METADATA_UPDATE_TIME_KEY}=<timestamp>")
     print(f"{'='*70}")
     
     if args.dry_run:
@@ -808,8 +744,8 @@ Examples:
   # Update all files (disable extension filter)
   python s3_cache_control_manager.py update --bucket my-bucket --no-extension-filter
   
-  # Update without adding custom tags
-  python s3_cache_control_manager.py update --bucket my-bucket --no-tags
+  # Update without adding custom metadata
+  python s3_cache_control_manager.py update --bucket my-bucket --no-metadata
   
   # Dry run to see what would be changed
   python s3_cache_control_manager.py update --bucket my-bucket --dry-run
@@ -849,9 +785,9 @@ Examples:
         help='Disable extension filtering (process all files)'
     )
     update_parser.add_argument(
-        '--no-tags',
+        '--no-metadata',
         action='store_true',
-        help='Skip adding custom identification tags to objects'
+        help='Skip adding custom identification metadata to objects'
     )
     update_parser.add_argument(
         '--region',
