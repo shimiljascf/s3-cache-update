@@ -32,6 +32,24 @@ A robust Python script to manage Cache-Control headers for S3 objects with advan
 pip install boto3
 ```
 
+## 🛠️ Installation
+
+### Option 1: Clone the repository
+
+```bash
+git clone https://github.com/shimiljascf/s3-cache-update.git
+cd s3-cache-update
+pip install -r requirements.txt
+```
+
+### Option 2: Direct download
+
+```bash
+curl -O https://raw.githubusercontent.com/shimiljascf/s3-cache-update/master/s3_cache_control_manager.py
+pip install boto3
+```
+
+
 ## AWS Credentials Setup
 
 Configure AWS credentials using one of these methods:
